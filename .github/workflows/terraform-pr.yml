@@ -227,7 +227,7 @@ jobs:
     name: Validate Stage
     needs: detect-changes
     if: needs.detect-changes.outputs.has-changes == 'true' && needs.detect-changes.outputs.stage == 'true'
-    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@refactor/terraform-reusable-workflows
     with:
       workspace_name: stage
       workspace_path: ${{ inputs.stage_workspace_path }}
@@ -252,7 +252,7 @@ jobs:
       needs.detect-changes.outputs.has-changes == 'true' &&
       needs.detect-changes.outputs.prod == 'true' &&
       (needs.validate-stage.result == 'success' || needs.validate-stage.result == 'skipped')
-    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@refactor/terraform-reusable-workflows
     with:
       workspace_name: prod
       workspace_path: ${{ inputs.prod_workspace_path }}
@@ -416,7 +416,7 @@ jobs:
             await generateComment({ github, context, core }, results, validateResult, mergeResult, versionChanges);
 
       - name: Post PR comment
-        uses: swoogo/.github/.github/actions/post-pr-comment@main
+        uses: swoogo/.github/.github/actions/post-pr-comment@refactor/terraform-reusable-workflows
         with:
           pr-number: ${{ github.event.pull_request.number }}
           comment-tag: summary
@@ -457,7 +457,7 @@ jobs:
           fi
 
       - name: Set commit status
-        uses: swoogo/.github/.github/actions/set-commit-status@main
+        uses: swoogo/.github/.github/actions/set-commit-status@refactor/terraform-reusable-workflows
         with:
           sha: ${{ github.event.pull_request.head.sha }}
           state: ${{ steps.determine-status.outputs.state }}
@@ -582,7 +582,7 @@ jobs:
           fi
 
       - name: Set security scan status
-        uses: swoogo/.github/.github/actions/set-commit-status@main
+        uses: swoogo/.github/.github/actions/set-commit-status@refactor/terraform-reusable-workflows
         with:
           sha: ${{ github.event.pull_request.head.sha }}
           state: ${{ steps.aggregate-checks.outputs.security_state }}
@@ -592,7 +592,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Set policy check status
-        uses: swoogo/.github/.github/actions/set-commit-status@main
+        uses: swoogo/.github/.github/actions/set-commit-status@refactor/terraform-reusable-workflows
         with:
           sha: ${{ github.event.pull_request.head.sha }}
           state: ${{ steps.aggregate-checks.outputs.policy_state }}
@@ -602,7 +602,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Set synthetic merge status
-        uses: swoogo/.github/.github/actions/set-commit-status@main
+        uses: swoogo/.github/.github/actions/set-commit-status@refactor/terraform-reusable-workflows
         with:
           sha: ${{ github.event.pull_request.head.sha }}
           state: ${{ steps.merge-status.outputs.state }}
