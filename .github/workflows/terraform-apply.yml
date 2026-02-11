@@ -1,0 +1,230 @@
+---
+name: Terraform Post-Merge
+
+# Org-level reusable workflow for post-merge Terraform plan
+# Validates the merged state by running plans for changed environments
+# No auto-apply — apply is manual only
+# Usage: swoogo/.github/.github/workflows/terraform-apply.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      stage_workspace_path:
+        description: 'Path to stage terraform environment directory'
+        required: false
+        type: string
+        default: 'terraform/environments/stage'
+      prod_workspace_path:
+        description: 'Path to prod terraform environment directory'
+        required: false
+        type: string
+        default: 'terraform/environments/prod'
+      module_path:
+        description: 'Path to shared terraform modules directory'
+        required: false
+        type: string
+        default: 'terraform/modules'
+      stage_aws_role_arn:
+        description: 'AWS IAM role ARN for stage OIDC authentication'
+        required: true
+        type: string
+      prod_aws_role_arn:
+        description: 'AWS IAM role ARN for prod OIDC authentication'
+        required: true
+        type: string
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.12.0'
+      aws_region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'eu-west-1'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
+
+jobs:
+  # Job 1: Detect which environments changed in the merge
+  detect-changes:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      stage: ${{ steps.detect.outputs.stage }}
+      prod: ${{ steps.detect.outputs.prod }}
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+      pr-number: ${{ steps.find-pr.outputs.pr-number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect environment changes
+        id: detect
+        run: |
+          CHANGED_FILES=$(git diff --name-only HEAD~1..HEAD)
+
+          STAGE_PATH="${{ inputs.stage_workspace_path }}"
+          PROD_PATH="${{ inputs.prod_workspace_path }}"
+          MODULE_PATH="${{ inputs.module_path }}"
+
+          STAGE_CHANGED=false
+          PROD_CHANGED=false
+
+          if echo "$CHANGED_FILES" | grep -qE "^${STAGE_PATH}/"; then
+            STAGE_CHANGED=true
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE "^${PROD_PATH}/"; then
+            PROD_CHANGED=true
+          fi
+
+          # Shared paths trigger both environments
+          if echo "$CHANGED_FILES" | grep -qE "^${MODULE_PATH}/|^\.github/workflows/terraform-|^\.github/actions/|^\.github/policies/|^\.github/scripts/|^\.github/prompts/"; then
+            STAGE_CHANGED=true
+            PROD_CHANGED=true
+          fi
+
+          echo "stage=$STAGE_CHANGED" >> $GITHUB_OUTPUT
+          echo "prod=$PROD_CHANGED" >> $GITHUB_OUTPUT
+
+          if [ "$STAGE_CHANGED" = "true" ] || [ "$PROD_CHANGED" = "true" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Stage changed: $STAGE_CHANGED, Prod changed: $PROD_CHANGED"
+
+      - name: Find associated PR
+        id: find-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER="unknown"
+          fi
+          echo "pr-number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "Associated PR: #$PR_NUMBER"
+
+  # Job 2: Plan stage (runs first)
+  plan-stage:
+    name: Plan Stage
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true' && needs.detect-changes.outputs.stage == 'true'
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    with:
+      workspace_name: stage
+      workspace_path: ${{ inputs.stage_workspace_path }}
+      environment: stage
+      operation: plan
+      git_ref: main
+      pr_number: ${{ needs.detect-changes.outputs.pr-number }}
+      terraform_version: ${{ inputs.terraform_version }}
+      run_security_scan: false
+      run_opa_policy: false
+      aws_role_arn: ${{ inputs.stage_aws_role_arn }}
+      aws_region: ${{ inputs.aws_region }}
+    secrets: inherit
+
+  # Job 3: Plan prod (runs after stage succeeds)
+  plan-prod:
+    name: Plan Prod
+    needs: [detect-changes, plan-stage]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.has-changes == 'true' &&
+      needs.detect-changes.outputs.prod == 'true' &&
+      (needs.plan-stage.result == 'success' || needs.plan-stage.result == 'skipped')
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    with:
+      workspace_name: prod
+      workspace_path: ${{ inputs.prod_workspace_path }}
+      environment: prod
+      operation: plan
+      git_ref: main
+      pr_number: ${{ needs.detect-changes.outputs.pr-number }}
+      terraform_version: ${{ inputs.terraform_version }}
+      run_security_scan: false
+      run_opa_policy: false
+      aws_role_arn: ${{ inputs.prod_aws_role_arn }}
+      aws_region: ${{ inputs.aws_region }}
+    secrets: inherit
+
+  # Job 4: Post status to original PR
+  post-status:
+    name: Post Status to PR
+    runs-on: ubuntu-latest
+    needs: [detect-changes, plan-stage, plan-prod]
+    if: always() && needs.detect-changes.outputs.has-changes == 'true' && needs.detect-changes.outputs.pr-number != 'unknown'
+    steps:
+      - name: Gather results
+        id: gather-results
+        env:
+          STAGE_RESULT: ${{ needs.plan-stage.result }}
+          PROD_RESULT: ${{ needs.plan-prod.result }}
+        run: |
+          STAGE="${STAGE_RESULT:-skipped}"
+          PROD="${PROD_RESULT:-skipped}"
+
+          if [[ "$STAGE" == "success" || "$STAGE" == "skipped" ]] && [[ "$PROD" == "success" || "$PROD" == "skipped" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate status comment
+        id: generate-comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.gather-results.outputs.status }}';
+            const stageResult = '${{ needs.plan-stage.result }}' || 'skipped';
+            const prodResult = '${{ needs.plan-prod.result }}' || 'skipped';
+            const workflowUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            let commentBody = '';
+
+            if (status === 'success') {
+              commentBody = [
+                '## Post-Merge Terraform Plan',
+                '',
+                `**Stage**: ${stageResult === 'success' ? 'Plan succeeded' : 'Skipped (no changes)'}`,
+                `**Prod**: ${prodResult === 'success' ? 'Plan succeeded' : 'Skipped (no changes)'}`,
+                '',
+                `[View Workflow](${workflowUrl})`,
+                '',
+                '> Apply is manual-only. Run `terraform apply` locally when ready.',
+                '',
+                `**Timestamp**: ${new Date().toISOString()}`,
+              ].join('\n');
+            } else {
+              commentBody = [
+                '## Post-Merge Terraform Plan Failed',
+                '',
+                `**Stage**: ${stageResult}`,
+                `**Prod**: ${prodResult}`,
+                '',
+                `[View Workflow](${workflowUrl})`,
+                '',
+                '**Action Required**: Review workflow logs and fix issues.',
+              ].join('\n');
+            }
+
+            core.setOutput('body', commentBody);
+
+      - name: Post status to PR
+        uses: swoogo/.github/.github/actions/post-pr-comment@main
+        with:
+          pr-number: ${{ needs.detect-changes.outputs.pr-number }}
+          comment-tag: terraform-post-merge-status
+          comment-body: ${{ steps.generate-comment.outputs.body }}
+          token: ${{ github.token }}

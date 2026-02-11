@@ -1,0 +1,69 @@
+---
+name: 'Post PR Comment'
+description: 'Create or update a PR comment with idempotent tag-based identification'
+
+inputs:
+  pr-number:
+    description: 'PR number to comment on'
+    required: true
+  comment-tag:
+    description: 'Unique tag for identifying the comment (for updates)'
+    required: true
+  comment-body:
+    description: 'Comment body in Markdown'
+    required: true
+  token:
+    description: 'GitHub token (app token for bot identity, or default GITHUB_TOKEN)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Post or update PR comment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.token || github.token }}
+        script: |
+          const prNumber = parseInt('${{ inputs.pr-number }}');
+          const tag = '${{ inputs.comment-tag }}';
+          const body = process.env.COMMENT_BODY;
+          const marker = `<!-- terraform-cicd:${tag} -->`;
+          const fullBody = `${marker}\n${body}`;
+
+          if (!prNumber || isNaN(prNumber)) {
+            console.log('No valid PR number provided, skipping comment');
+            return;
+          }
+
+          // Find existing comment with this tag
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            per_page: 100
+          });
+
+          const existing = comments.find(c => c.body && c.body.includes(marker));
+
+          if (existing) {
+            // Delete and recreate (avoids edit history clutter)
+            console.log(`Replacing existing comment ${existing.id} for tag: ${tag}`);
+            await github.rest.issues.deleteComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id
+            });
+          }
+
+          // Create new comment
+          const { data: newComment } = await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+            body: fullBody
+          });
+
+          console.log(`Comment posted: ${newComment.html_url}`);
+      env:
+        COMMENT_BODY: ${{ inputs.comment-body }}

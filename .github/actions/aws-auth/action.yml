@@ -1,0 +1,21 @@
+---
+name: AWS Auth
+description: Authenticate with AWS
+
+inputs:
+  role:
+    description: "The ARN of the role to assume"
+    required: true
+  region:
+    description: "The AWS region to use"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role }}
+        aws-region: ${{ inputs.region }}
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2

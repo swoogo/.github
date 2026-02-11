@@ -1,0 +1,612 @@
+---
+name: Terraform PR Validation
+
+# Org-level reusable orchestrator for Terraform PR checks
+# Detects changed environments, validates sequentially (stage→prod),
+# posts PR comments, and sets commit statuses
+# Usage: swoogo/.github/.github/workflows/terraform-pr.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      stage_workspace_path:
+        description: 'Path to stage terraform environment directory'
+        required: false
+        type: string
+        default: 'terraform/environments/stage'
+      prod_workspace_path:
+        description: 'Path to prod terraform environment directory'
+        required: false
+        type: string
+        default: 'terraform/environments/prod'
+      module_path:
+        description: 'Path to shared terraform modules directory'
+        required: false
+        type: string
+        default: 'terraform/modules'
+      stage_aws_role_arn:
+        description: 'AWS IAM role ARN for stage OIDC authentication'
+        required: true
+        type: string
+      prod_aws_role_arn:
+        description: 'AWS IAM role ARN for prod OIDC authentication'
+        required: true
+        type: string
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.12.0'
+      aws_region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'eu-west-1'
+      run_security_scan:
+        description: 'Run tfsec security scan'
+        required: false
+        type: boolean
+        default: true
+      run_opa_policy:
+        description: 'Run OPA policy checks'
+        required: false
+        type: boolean
+        default: true
+      versions_file:
+        description: 'Path to versions.tf for version change detection (empty to skip)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
+  statuses: write
+
+jobs:
+  # Job 1: Detect which environments have changes and version bumps
+  detect-changes:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      stage: ${{ steps.detect.outputs.stage }}
+      prod: ${{ steps.detect.outputs.prod }}
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+      version_changes: ${{ steps.detect-versions.outputs.version_changes }}
+      has_version_changes: ${{ steps.detect-versions.outputs.has_version_changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect environment changes
+        id: detect
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          CHANGED_FILES=$(git diff --name-only origin/"$BASE_REF"...HEAD)
+
+          STAGE_PATH="${{ inputs.stage_workspace_path }}"
+          PROD_PATH="${{ inputs.prod_workspace_path }}"
+          MODULE_PATH="${{ inputs.module_path }}"
+
+          STAGE_CHANGED=false
+          PROD_CHANGED=false
+
+          # Check for stage-specific changes
+          if echo "$CHANGED_FILES" | grep -qE "^${STAGE_PATH}/"; then
+            STAGE_CHANGED=true
+          fi
+
+          # Check for prod-specific changes
+          if echo "$CHANGED_FILES" | grep -qE "^${PROD_PATH}/"; then
+            PROD_CHANGED=true
+          fi
+
+          # Shared paths trigger both environments
+          if echo "$CHANGED_FILES" | grep -qE "^${MODULE_PATH}/|^\.github/workflows/terraform-|^\.github/actions/|^\.github/policies/|^\.github/scripts/|^\.github/prompts/"; then
+            STAGE_CHANGED=true
+            PROD_CHANGED=true
+          fi
+
+          echo "stage=$STAGE_CHANGED" >> $GITHUB_OUTPUT
+          echo "prod=$PROD_CHANGED" >> $GITHUB_OUTPUT
+
+          if [ "$STAGE_CHANGED" = "true" ] || [ "$PROD_CHANGED" = "true" ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Stage changed: $STAGE_CHANGED, Prod changed: $PROD_CHANGED"
+
+      - name: Detect version changes
+        id: detect-versions
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          VERSION_CHANGES="[]"
+
+          # --- Terraform CLI version ---
+          for file in .github/workflows/terraform-*.yml; do
+            [ -f "$file" ] || continue
+            if git diff origin/"$BASE_REF"...HEAD -- "$file" | grep -q "terraform_version"; then
+              OLD_VER=$(git show origin/"$BASE_REF":"$file" 2>/dev/null | grep -oP "terraform_version[^'\"]*['\"]\\K[0-9]+\\.[0-9]+\\.[0-9]+" | head -1 || echo "")
+              NEW_VER=$(grep -oP "terraform_version[^'\"]*['\"]\\K[0-9]+\\.[0-9]+\\.[0-9]+" "$file" 2>/dev/null | head -1 || echo "")
+              if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+                VERSION_CHANGES=$(echo "$VERSION_CHANGES" | jq -c --arg tool "Terraform CLI" --arg from "$OLD_VER" --arg to "$NEW_VER" --arg file "$file" --arg cat "core" '. + [{"tool":$tool,"from":$from,"to":$to,"file":$file,"category":$cat}]')
+                break
+              fi
+            fi
+          done
+
+          # --- tfsec version ---
+          for file in .github/workflows/terraform-*.yml; do
+            [ -f "$file" ] || continue
+            if git diff origin/"$BASE_REF"...HEAD -- "$file" | grep -q "TFSEC_VERSION"; then
+              OLD_VER=$(git show origin/"$BASE_REF":"$file" 2>/dev/null | grep 'TFSEC_VERSION=' | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+              NEW_VER=$(grep 'TFSEC_VERSION=' "$file" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+              if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+                VERSION_CHANGES=$(echo "$VERSION_CHANGES" | jq -c --arg tool "tfsec" --arg from "$OLD_VER" --arg to "$NEW_VER" --arg file "$file" --arg cat "ci-tool" '. + [{"tool":$tool,"from":$from,"to":$to,"file":$file,"category":$cat}]')
+              fi
+              break
+            fi
+          done
+
+          # --- OPA version ---
+          for file in .github/workflows/terraform-*.yml; do
+            [ -f "$file" ] || continue
+            if git diff origin/"$BASE_REF"...HEAD -- "$file" | grep -q "OPA_VERSION"; then
+              OLD_VER=$(git show origin/"$BASE_REF":"$file" 2>/dev/null | grep 'OPA_VERSION=' | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+              NEW_VER=$(grep 'OPA_VERSION=' "$file" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+              if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+                VERSION_CHANGES=$(echo "$VERSION_CHANGES" | jq -c --arg tool "OPA" --arg from "$OLD_VER" --arg to "$NEW_VER" --arg file "$file" --arg cat "ci-tool" '. + [{"tool":$tool,"from":$from,"to":$to,"file":$file,"category":$cat}]')
+              fi
+              break
+            fi
+          done
+
+          # --- Provider versions ---
+          VERSIONS_FILE="${{ inputs.versions_file }}"
+          if [ -n "$VERSIONS_FILE" ] && [ -f "$VERSIONS_FILE" ]; then
+            if git diff origin/"$BASE_REF"...HEAD -- "$VERSIONS_FILE" | grep -q "version"; then
+              for provider in aws newrelic random; do
+                OLD_VER=$(git show origin/"$BASE_REF":"$VERSIONS_FILE" 2>/dev/null | grep -A3 "\"hashicorp/$provider\"\|\"newrelic/$provider\"" | grep 'version' | grep -oP '"[^"]*"' | tr -d '"' | head -1 || echo "")
+                NEW_VER=$(grep -A3 "\"hashicorp/$provider\"\|\"newrelic/$provider\"" "$VERSIONS_FILE" | grep 'version' | grep -oP '"[^"]*"' | tr -d '"' | head -1 || echo "")
+                if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+                  VERSION_CHANGES=$(echo "$VERSION_CHANGES" | jq -c --arg tool "$provider provider" --arg from "$OLD_VER" --arg to "$NEW_VER" --arg file "$VERSIONS_FILE" --arg cat "provider" '. + [{"tool":$tool,"from":$from,"to":$to,"file":$file,"category":$cat}]')
+                fi
+              done
+            fi
+          fi
+
+          # --- GitHub Action version changes ---
+          DIFF_OUTPUT=$(git diff origin/"$BASE_REF"...HEAD -- '.github/workflows/*.yml' || true)
+          if [ -n "$DIFF_OUTPUT" ]; then
+            REMOVED=$(echo "$DIFF_OUTPUT" | grep '^-.*uses:' | grep -oP 'uses:\s*\K\S+' || true)
+            ADDED=$(echo "$DIFF_OUTPUT" | grep '^\+.*uses:' | grep -oP 'uses:\s*\K\S+' || true)
+
+            declare -A old_versions new_versions
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              action=$(echo "$line" | sed 's/@.*//')
+              version=$(echo "$line" | sed 's/.*@//')
+              old_versions["$action"]="$version"
+            done <<< "$REMOVED"
+
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              action=$(echo "$line" | sed 's/@.*//')
+              version=$(echo "$line" | sed 's/.*@//')
+              new_versions["$action"]="$version"
+            done <<< "$ADDED"
+
+            for action in "${!new_versions[@]}"; do
+              if [ -n "${old_versions[$action]}" ] && [ "${old_versions[$action]}" != "${new_versions[$action]}" ]; then
+                VERSION_CHANGES=$(echo "$VERSION_CHANGES" | jq -c --arg tool "$action" --arg from "${old_versions[$action]}" --arg to "${new_versions[$action]}" --arg file ".github/workflows/" --arg cat "github-action" '. + [{"tool":$tool,"from":$from,"to":$to,"file":$file,"category":$cat}]')
+              fi
+            done
+          fi
+
+          echo "version_changes=$VERSION_CHANGES" >> $GITHUB_OUTPUT
+
+          COUNT=$(echo "$VERSION_CHANGES" | jq 'length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "has_version_changes=true" >> $GITHUB_OUTPUT
+            echo "Detected $COUNT version change(s)"
+            echo "$VERSION_CHANGES" | jq .
+          else
+            echo "has_version_changes=false" >> $GITHUB_OUTPUT
+            echo "No version changes detected"
+          fi
+
+  # Job 2: Validate stage environment (plan + drift-detection on single EC2 runner)
+  validate-stage:
+    name: Validate Stage
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true' && needs.detect-changes.outputs.stage == 'true'
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    with:
+      workspace_name: stage
+      workspace_path: ${{ inputs.stage_workspace_path }}
+      environment: stage
+      operation: plan,drift-detection
+      git_ref: ${{ github.event.pull_request.head.sha }}
+      merge_target: ${{ github.event.pull_request.base.ref }}
+      pr_number: ${{ github.event.pull_request.number }}
+      terraform_version: ${{ inputs.terraform_version }}
+      run_security_scan: ${{ inputs.run_security_scan }}
+      run_opa_policy: ${{ inputs.run_opa_policy }}
+      aws_role_arn: ${{ inputs.stage_aws_role_arn }}
+      aws_region: ${{ inputs.aws_region }}
+    secrets: inherit
+
+  # Job 3: Validate prod environment (after stage succeeds)
+  validate-prod:
+    name: Validate Prod
+    needs: [detect-changes, validate-stage]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.has-changes == 'true' &&
+      needs.detect-changes.outputs.prod == 'true' &&
+      (needs.validate-stage.result == 'success' || needs.validate-stage.result == 'skipped')
+    uses: swoogo/.github/.github/workflows/terraform-main.yml@main
+    with:
+      workspace_name: prod
+      workspace_path: ${{ inputs.prod_workspace_path }}
+      environment: prod
+      operation: plan,drift-detection
+      git_ref: ${{ github.event.pull_request.head.sha }}
+      merge_target: ${{ github.event.pull_request.base.ref }}
+      pr_number: ${{ github.event.pull_request.number }}
+      terraform_version: ${{ inputs.terraform_version }}
+      run_security_scan: ${{ inputs.run_security_scan }}
+      run_opa_policy: ${{ inputs.run_opa_policy }}
+      aws_role_arn: ${{ inputs.prod_aws_role_arn }}
+      aws_region: ${{ inputs.aws_region }}
+    secrets: inherit
+
+  # Job 4: Post consolidated PR comment
+  update-pr-comment:
+    name: Update PR Comment
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate-stage, validate-prod]
+    if: always() && needs.detect-changes.outputs.has-changes == 'true'
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+
+      - name: Checkout org repo for shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: swoogo/.github
+          path: .org-github
+          sparse-checkout: |
+            .github/scripts
+            .github/prompts
+
+      - name: Download all environment results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: results-*-pr-${{ github.event.pull_request.number }}
+          path: /tmp/results
+          merge-multiple: false
+
+      - name: Check artifact availability
+        id: check-artifacts
+        run: |
+          if [ -d "/tmp/results" ] && [ "$(ls -A /tmp/results 2>/dev/null)" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "Found result artifacts"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "No result artifacts - will generate basic comment"
+          fi
+
+      - name: Aggregate environment results
+        if: steps.check-artifacts.outputs.available == 'true'
+        id: aggregate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultsDir = '/tmp/results';
+            const environmentResults = [];
+
+            const dirs = fs.readdirSync(resultsDir);
+            for (const dir of dirs) {
+              const summaryPath = path.join(resultsDir, dir, 'results-summary.json');
+              if (!fs.existsSync(summaryPath)) continue;
+
+              const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+
+              // Load additional artifacts
+              const tfsecPath = path.join(resultsDir, dir, 'tfsec-results.json');
+              const opaPath = path.join(resultsDir, dir, 'opa-results.json');
+              const planJsonPath = path.join(resultsDir, dir, 'plan.json');
+
+              summary.tfsec_results = fs.existsSync(tfsecPath) ?
+                JSON.parse(fs.readFileSync(tfsecPath, 'utf8')) : null;
+              if (fs.existsSync(opaPath)) {
+                try {
+                  const opaData = JSON.parse(fs.readFileSync(opaPath, 'utf8'));
+                  summary.opa_results = opaData?.result?.[0]?.expressions?.[0]?.value || [];
+                } catch (e) {
+                  summary.opa_results = null;
+                }
+              } else {
+                summary.opa_results = null;
+              }
+
+              // Extract only resource changes from plan.json (not the full file)
+              summary.resource_changes = [];
+              if (fs.existsSync(planJsonPath)) {
+                try {
+                  const planJson = JSON.parse(fs.readFileSync(planJsonPath, 'utf8'));
+                  for (const rc of (planJson.resource_changes || [])) {
+                    if (!rc.change?.actions) continue;
+                    const actions = rc.change.actions;
+                    if (actions.includes('no-op') && actions.length === 1) continue;
+                    summary.resource_changes.push({
+                      address: rc.address,
+                      type: rc.type,
+                      actions: rc.change.actions,
+                      before: rc.change?.before || {},
+                      after: rc.change?.after || {}
+                    });
+                  }
+                } catch (e) {
+                  console.log(`Warning: Could not parse plan.json for ${dir}: ${e.message}`);
+                }
+              }
+
+              environmentResults.push(summary);
+            }
+
+            core.setOutput('results', JSON.stringify(environmentResults));
+            return environmentResults;
+
+      - name: Aggregate status from validation jobs
+        id: aggregate-status
+        run: |
+          STAGE_RESULT="${{ needs.validate-stage.result }}"
+          PROD_RESULT="${{ needs.validate-prod.result }}"
+
+          # Validate is success if all validation jobs are success or skipped
+          if [[ ("$STAGE_RESULT" == "success" || "$STAGE_RESULT" == "skipped") && ("$PROD_RESULT" == "success" || "$PROD_RESULT" == "skipped") ]]; then
+            echo "validate-result=success" >> $GITHUB_OUTPUT
+          else
+            echo "validate-result=failure" >> $GITHUB_OUTPUT
+          fi
+
+          # Drift detection match from workflow outputs (empty = failure)
+          STAGE_DRIFT="${{ needs.validate-stage.outputs.drift-detection-match }}"
+          PROD_DRIFT="${{ needs.validate-prod.outputs.drift-detection-match }}"
+
+          # Merge is success if drift-detection checksums match (or job was skipped)
+          MERGE_OK=true
+          if [[ "$STAGE_RESULT" == "success" && "$STAGE_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+          if [[ "$PROD_RESULT" == "success" && "$PROD_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+
+          if [[ "$MERGE_OK" == "true" ]]; then
+            echo "merge-result=success" >> $GITHUB_OUTPUT
+          else
+            echo "merge-result=failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate enhanced PR comment
+        id: generate-comment
+        uses: actions/github-script@v7
+        env:
+          AGGREGATE_RESULTS: ${{ steps.aggregate.outputs.results }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VERSION_CHANGES: ${{ needs.detect-changes.outputs.version_changes }}
+        with:
+          script: |
+            const generateComment = require('./.org-github/.github/scripts/generate-pr-comment-claude.js');
+            const results = JSON.parse(process.env.AGGREGATE_RESULTS || '[]');
+            const validateResult = '${{ steps.aggregate-status.outputs.validate-result }}';
+            const mergeResult = '${{ steps.aggregate-status.outputs.merge-result }}';
+            const versionChanges = JSON.parse(process.env.VERSION_CHANGES || '[]');
+            await generateComment({ github, context, core }, results, validateResult, mergeResult, versionChanges);
+
+      - name: Post PR comment
+        uses: swoogo/.github/.github/actions/post-pr-comment@main
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
+          comment-tag: summary
+          comment-body: ${{ steps.generate-comment.outputs.body }}
+          token: ${{ github.token }}
+
+  # Job 5: Set commit status for branch protection
+  set-commit-status:
+    name: Set Commit Status
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate-stage, validate-prod]
+    if: always() && needs.detect-changes.outputs.has-changes == 'true'
+    steps:
+      - name: Determine status
+        id: determine-status
+        run: |
+          STAGE_RESULT="${{ needs.validate-stage.result }}"
+          PROD_RESULT="${{ needs.validate-prod.result }}"
+
+          VALIDATE_OK=true
+          if [[ "$STAGE_RESULT" != "success" && "$STAGE_RESULT" != "skipped" ]]; then VALIDATE_OK=false; fi
+          if [[ "$PROD_RESULT" != "success" && "$PROD_RESULT" != "skipped" ]]; then VALIDATE_OK=false; fi
+
+          # Check drift-detection match from workflow outputs
+          STAGE_DRIFT="${{ needs.validate-stage.outputs.drift-detection-match }}"
+          PROD_DRIFT="${{ needs.validate-prod.outputs.drift-detection-match }}"
+
+          MERGE_OK=true
+          if [[ "$STAGE_RESULT" == "success" && "$STAGE_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+          if [[ "$PROD_RESULT" == "success" && "$PROD_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+
+          if [[ "$VALIDATE_OK" == "true" ]] && [[ "$MERGE_OK" == "true" ]]; then
+            echo "state=success" >> $GITHUB_OUTPUT
+            echo "description=All Terraform checks passed" >> $GITHUB_OUTPUT
+          else
+            echo "state=failure" >> $GITHUB_OUTPUT
+            echo "description=Terraform checks failed - see PR comments" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set commit status
+        uses: swoogo/.github/.github/actions/set-commit-status@main
+        with:
+          sha: ${{ github.event.pull_request.head.sha }}
+          state: ${{ steps.determine-status.outputs.state }}
+          context: terraform/pr-validation
+          description: ${{ steps.determine-status.outputs.description }}
+          target-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ github.token }}
+
+  # Job 6: Set granular status checks
+  set-granular-statuses:
+    name: Set Granular Status Checks
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate-stage, validate-prod]
+    if: always() && needs.detect-changes.outputs.has-changes == 'true'
+    steps:
+      - name: Download all environment results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: results-*-pr-${{ github.event.pull_request.number }}
+          path: /tmp/results
+          merge-multiple: false
+
+      - name: Aggregate check results
+        id: aggregate-checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            let securityFailed = false;
+            let securityError = false;
+            let securityIssueCount = 0;
+            let criticalHighCount = 0;
+            let policyViolationCount = 0;
+            let policyError = false;
+
+            const resultsDir = '/tmp/results';
+            if (fs.existsSync(resultsDir)) {
+              for (const dir of fs.readdirSync(resultsDir)) {
+                const summaryPath = path.join(resultsDir, dir, 'results-summary.json');
+                if (!fs.existsSync(summaryPath)) continue;
+
+                const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+
+                if (summary.security_status === 'error') {
+                  securityError = true;
+                } else if (summary.security_status === 'fail') {
+                  const tfsecPath = path.join(resultsDir, dir, 'tfsec-results.json');
+                  if (fs.existsSync(tfsecPath)) {
+                    const tfsec = JSON.parse(fs.readFileSync(tfsecPath, 'utf8'));
+                    const results = tfsec.results || [];
+                    securityIssueCount += results.length;
+
+                    for (const r of results) {
+                      const sev = (r.severity || '').toUpperCase();
+                      if (sev === 'CRITICAL' || sev === 'HIGH') {
+                        criticalHighCount++;
+                        securityFailed = true;
+                      }
+                    }
+                  }
+                }
+
+                if (summary.opa_status === 'error') {
+                  policyError = true;
+                } else if (summary.opa_status === 'fail') {
+                  const opaPath = path.join(resultsDir, dir, 'opa-results.json');
+                  if (fs.existsSync(opaPath)) {
+                    try {
+                      const opaData = JSON.parse(fs.readFileSync(opaPath, 'utf8'));
+                      const violations = opaData?.result?.[0]?.expressions?.[0]?.value || [];
+                      policyViolationCount += violations.length;
+                    } catch (e) {
+                      console.log(`Warning: Could not parse OPA results for ${dir}: ${e.message}`);
+                    }
+                  }
+                }
+              }
+            }
+
+            // Security status (non-blocking - report only)
+            if (securityError) {
+              core.setOutput('security_state', 'error');
+              core.setOutput('security_description', 'Security scan failed to execute - check runner logs');
+            } else {
+              core.setOutput('security_state', 'success');
+              core.setOutput('security_description', securityFailed ?
+                `${criticalHighCount} critical/high issue(s) found (see PR comment)` :
+                (securityIssueCount > 0 ? `${securityIssueCount} medium issue(s) found (see PR comment)` : 'No security issues'));
+            }
+
+            // Policy status (always success - warnings only, unless error)
+            if (policyError) {
+              core.setOutput('policy_state', 'error');
+              core.setOutput('policy_description', 'Policy evaluation failed to execute - check runner logs');
+            } else {
+              core.setOutput('policy_state', 'success');
+              core.setOutput('policy_description', policyViolationCount > 0 ?
+                `${policyViolationCount} warning(s) - see PR comment` : 'No policy violations');
+            }
+
+      - name: Determine merge test status
+        id: merge-status
+        run: |
+          STAGE_RESULT="${{ needs.validate-stage.result }}"
+          PROD_RESULT="${{ needs.validate-prod.result }}"
+          STAGE_DRIFT="${{ needs.validate-stage.outputs.drift-detection-match }}"
+          PROD_DRIFT="${{ needs.validate-prod.outputs.drift-detection-match }}"
+
+          MERGE_OK=true
+          if [[ "$STAGE_RESULT" == "success" && "$STAGE_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+          if [[ "$PROD_RESULT" == "success" && "$PROD_DRIFT" != "true" ]]; then MERGE_OK=false; fi
+
+          if [[ "$MERGE_OK" == "true" ]]; then
+            echo "state=success" >> $GITHUB_OUTPUT
+            echo "description=Checksum validation passed" >> $GITHUB_OUTPUT
+          else
+            echo "state=failure" >> $GITHUB_OUTPUT
+            echo "description=Checksum mismatch - rebase required" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set security scan status
+        uses: swoogo/.github/.github/actions/set-commit-status@main
+        with:
+          sha: ${{ github.event.pull_request.head.sha }}
+          state: ${{ steps.aggregate-checks.outputs.security_state }}
+          context: terraform/security-scan
+          description: ${{ steps.aggregate-checks.outputs.security_description }}
+          target-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ github.token }}
+
+      - name: Set policy check status
+        uses: swoogo/.github/.github/actions/set-commit-status@main
+        with:
+          sha: ${{ github.event.pull_request.head.sha }}
+          state: ${{ steps.aggregate-checks.outputs.policy_state }}
+          context: terraform/policy-check
+          description: ${{ steps.aggregate-checks.outputs.policy_description }}
+          target-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ github.token }}
+
+      - name: Set synthetic merge status
+        uses: swoogo/.github/.github/actions/set-commit-status@main
+        with:
+          sha: ${{ github.event.pull_request.head.sha }}
+          state: ${{ steps.merge-status.outputs.state }}
+          context: terraform/synthetic-merge
+          description: ${{ steps.merge-status.outputs.description }}
+          target-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ github.token }}

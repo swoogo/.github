@@ -1,0 +1,1005 @@
+---
+name: Terraform Reusable Workflow
+
+# Org-level reusable workflow for all Terraform operations
+# Called by repo-specific terraform-ci.yml via terraform-pr/apply orchestrators
+# Manages EC2 runner lifecycle and Terraform execution
+# Usage: swoogo/.github/.github/workflows/terraform-main.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      workspace_name:
+        description: 'Environment name (stage or prod)'
+        required: true
+        type: string
+      workspace_path:
+        description: 'Path to terraform environment directory'
+        required: true
+        type: string
+      environment:
+        description: 'GitHub environment (stage or prod)'
+        required: true
+        type: string
+      operation:
+        description: 'Terraform operation(s) to run. Single value (plan) or comma-separated (plan,drift-detection). Valid: plan, drift-detection, drift-check, apply'
+        required: true
+        type: string
+      git_ref:
+        description: 'Git ref to checkout'
+        required: true
+        type: string
+      merge_target:
+        description: 'Target branch for drift detection'
+        required: false
+        type: string
+        default: 'main'
+      pr_number:
+        description: 'PR number for artifact naming'
+        required: false
+        type: string
+        default: '0'
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.12.0'
+      run_security_scan:
+        description: 'Run tfsec security scan'
+        required: false
+        type: boolean
+        default: false
+      run_opa_policy:
+        description: 'Run OPA policy checks'
+        required: false
+        type: boolean
+        default: false
+      aws_role_arn:
+        description: 'AWS IAM role ARN for OIDC authentication'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'eu-west-1'
+
+    outputs:
+      plan-checksum:
+        description: 'SHA256 checksum of the plan structural fingerprint'
+        value: ${{ jobs.terraform-operation.outputs.plan-checksum }}
+      plan-summary:
+        description: 'Human-readable plan summary'
+        value: ${{ jobs.terraform-operation.outputs.plan-summary }}
+      security-status:
+        description: 'Security scan status (pass/fail/skipped)'
+        value: ${{ jobs.terraform-operation.outputs.security-status }}
+      opa-status:
+        description: 'OPA policy check status (pass/fail/skipped)'
+        value: ${{ jobs.terraform-operation.outputs.opa-status }}
+      drift-detection-match:
+        description: 'Whether drift detection checksums match'
+        value: ${{ jobs.terraform-operation.outputs.drift-detection-match }}
+      drift-detected:
+        description: 'Whether infrastructure drift was detected'
+        value: ${{ jobs.terraform-operation.outputs.drift-detected }}
+      artifact-name:
+        description: 'Name of the uploaded plan artifact'
+        value: ${{ jobs.terraform-operation.outputs.artifact-name }}
+
+jobs:
+  # Job 1: Get latest AMI for EC2 runner
+  get-latest-ami:
+    name: Get Latest AMI
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      ami-id: ${{ steps.get-ami.outputs.ami-id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Configure AWS credentials
+        uses: swoogo/.github/.github/actions/aws-auth@main
+        with:
+          region: ${{ inputs.aws_region }}
+          role: ${{ inputs.aws_role_arn }}
+
+      - name: Get latest AMI ID
+        id: get-ami
+        run: |
+          AMI_ID=$(aws ec2 describe-images \
+            --owners 135269210855 \
+            --filters "Name=name,Values=runs-on-v2.2-ubuntu24-full-x64-*" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+          echo "ami-id=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Latest AMI ID: $AMI_ID"
+
+  # Job 2: Start EC2 runner
+  start-runner:
+    name: Start EC2 Runner
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    needs: get-latest-ami
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Configure AWS credentials
+        uses: swoogo/.github/.github/actions/aws-auth@main
+        with:
+          region: ${{ inputs.aws_region }}
+          role: ${{ inputs.aws_role_arn }}
+
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.CI_REGISTER_RUNNER_TOKEN }}
+          ec2-image-id: ${{ needs.get-latest-ami.outputs.ami-id }}
+          ec2-instance-type: t3.medium
+          subnet-id: ${{ inputs.environment == 'stage' && vars.STAGE_RUNNER_SUBNET_ID || vars.PROD_RUNNER_SUBNET_ID }}
+          security-group-id: ${{ inputs.environment == 'stage' && vars.STAGE_RUNNER_SECURITY_GROUP_ID || vars.PROD_RUNNER_SECURITY_GROUP_ID }}
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "ec2-github-runner-terraform"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"},
+              {"Key": "Environment", "Value": "${{ inputs.environment }}"},
+              {"Key": "Operations", "Value": "${{ inputs.operation }}"}
+            ]
+
+  # Job 3: Terraform operation (runs on EC2 runner)
+  terraform-operation:
+    name: Terraform (${{ inputs.workspace_name }})
+    needs: [start-runner]
+    runs-on: ${{ needs.start-runner.outputs.label }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    outputs:
+      plan-checksum: ${{ steps.plan-outputs.outputs.checksum }}
+      plan-summary: ${{ steps.plan-outputs.outputs.summary }}
+      security-status: ${{ steps.security-outputs.outputs.status }}
+      opa-status: ${{ steps.opa-outputs.outputs.status }}
+      drift-detection-match: ${{ steps.drift-detection-outputs.outputs.checksum_match }}
+      drift-detected: ${{ steps.drift-outputs.outputs.detected }}
+      artifact-name: ${{ steps.artifact-outputs.outputs.name }}
+    env:
+      TF_PLUGIN_CACHE_DIR: /tmp/terraform-plugin-cache
+      TF_IN_AUTOMATION: true
+      TF_INPUT: false
+      TF_VAR_aws_profile: ""
+    steps:
+      - name: Resolve operations
+        id: resolve-ops
+        run: |
+          # Parse comma-separated operations into JSON array
+          # "plan,drift-detection" -> ["plan","drift-detection"]
+          IFS=',' read -ra OPS_ARRAY <<< "${{ inputs.operation }}"
+          JSON_ARRAY=$(printf '%s\n' "${OPS_ARRAY[@]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -sc .)
+          echo "ops=${JSON_ARRAY}" >> $GITHUB_OUTPUT
+          echo "Resolved operations: ${JSON_ARRAY}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: swoogo/.github/.github/actions/aws-auth@main
+        with:
+          region: ${{ inputs.aws_region }}
+          role: ${{ inputs.aws_role_arn }}
+
+      - name: Setup SSH agent for private modules
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_TERRAFORM_REPO_ACCESS_KEY }}
+
+      - name: Configure git for SSH module access
+        run: |
+          export HOME="${HOME:-/root}"
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Install tools
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+          # Install tfsec if security scan enabled (pinned version with checksum)
+          if [ "${{ inputs.run_security_scan }}" = "true" ]; then
+            TFSEC_VERSION="1.28.14"
+            TFSEC_SHA256="a32d0799bbefababaa4fcd814da9f4d251cd932789590b99d1d5fcb89ace6f68"
+            curl -sLo /usr/local/bin/tfsec "https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/tfsec-linux-amd64"
+            echo "${TFSEC_SHA256}  /usr/local/bin/tfsec" | sha256sum -c -
+            chmod +x /usr/local/bin/tfsec
+            echo "Installed tfsec v${TFSEC_VERSION}"
+          fi
+
+          # Install OPA if policy check enabled (pinned version with checksum)
+          if [ "${{ inputs.run_opa_policy }}" = "true" ]; then
+            OPA_VERSION="1.13.1"
+            OPA_SHA256="b6c96dbcaf9c1c03e95c326b9cdffc4f931bf6ac0ec93b3b98c1bac9deba93de"
+            curl -sLo /usr/local/bin/opa "https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_amd64_static"
+            echo "${OPA_SHA256}  /usr/local/bin/opa" | sha256sum -c -
+            chmod +x /usr/local/bin/opa
+            echo "Installed OPA v${OPA_VERSION}"
+          fi
+
+      # ========== INIT ==========
+      - name: Terraform Init
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+        run: |
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          INIT_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Terraform init attempt $RETRY_COUNT of $MAX_RETRIES..."
+
+            if timeout 300 terraform init -backend=true -input=false -backend-config="profile="; then
+              INIT_SUCCESS=true
+              echo "Terraform init succeeded on attempt $RETRY_COUNT"
+              break
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "Terraform init timed out after 5 minutes"
+              else
+                echo "Terraform init failed with exit code $EXIT_CODE"
+              fi
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                WAIT_TIME=$((30 * RETRY_COUNT))
+                echo "Retrying in ${WAIT_TIME} seconds..."
+                sleep $WAIT_TIME
+              fi
+            fi
+          done
+
+          if [ "$INIT_SUCCESS" != "true" ]; then
+            echo "Terraform init failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      # ========== VALIDATE OPERATION ==========
+      - name: Terraform Format Check
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'validate') || contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        working-directory: ${{ inputs.workspace_path }}
+        run: |
+          echo "Checking Terraform formatting..."
+          terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'validate') || contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          TF_VAR_newrelic_api_key: "validation-only-dummy-key"
+        run: |
+          echo "Validating Terraform configuration..."
+          terraform validate
+
+      # ========== SECURITY SCAN ==========
+      - name: Run tfsec Security Scan
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan') && inputs.run_security_scan
+        id: tfsec
+        working-directory: ${{ inputs.workspace_path }}
+        continue-on-error: true
+        run: |
+          echo "Running tfsec security scan..."
+          TFSEC_EXIT=0
+          tfsec . --format json --out tfsec-results.json --minimum-severity MEDIUM || TFSEC_EXIT=$?
+
+          # If tfsec crashed or results file is missing/empty, treat as error
+          if [ ! -s tfsec-results.json ]; then
+            echo "::warning::tfsec did not produce results (exit code: $TFSEC_EXIT)"
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "summary=scan failed (exit code $TFSEC_EXIT)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CRITICAL=$(jq '[.results[] | select(.severity == "CRITICAL")] | length' tfsec-results.json 2>/dev/null) || CRITICAL=-1
+          HIGH=$(jq '[.results[] | select(.severity == "HIGH")] | length' tfsec-results.json 2>/dev/null) || HIGH=-1
+          MEDIUM=$(jq '[.results[] | select(.severity == "MEDIUM")] | length' tfsec-results.json 2>/dev/null) || MEDIUM=-1
+
+          if [ "$CRITICAL" = "-1" ] || [ "$HIGH" = "-1" ] || [ "$MEDIUM" = "-1" ]; then
+            echo "::warning::Failed to parse tfsec results JSON"
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "summary=results parse failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "summary=$CRITICAL critical, $HIGH high, $MEDIUM medium" >> $GITHUB_OUTPUT
+          echo "tfsec results: $CRITICAL critical, $HIGH high, $MEDIUM medium"
+
+          if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ]; then
+            echo "status=fail" >> $GITHUB_OUTPUT
+            echo "Security issues found - PR will be flagged"
+          else
+            echo "status=pass" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set security scan outputs
+        id: security-outputs
+        run: |
+          status="${{ steps.tfsec.outputs.status }}"
+          echo "status=${status:-skipped}" >> $GITHUB_OUTPUT
+
+      # ========== PLAN OPERATION ==========
+      - name: Terraform Plan
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan') || contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-detection')
+        id: plan
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+        run: |
+          echo "Generating Terraform plan..."
+
+          # Attempt plan with automatic stale lock handling
+          set +e
+          terraform plan -out=tfplan.binary -input=false -no-color 2>&1 | tee plan-output.txt
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            # Check if failure was due to state lock
+            if grep -q "Error acquiring the state lock" plan-output.txt; then
+              echo "State lock detected, checking if stale..."
+
+              LOCK_ID=$(grep -A 10 "Lock Info:" plan-output.txt | grep "^  ID:" | awk '{print $2}')
+              LOCK_CREATED=$(grep "Created:" plan-output.txt | sed 's/.*Created: *//')
+              LOCK_OWNER=$(grep -A 10 "Lock Info:" plan-output.txt | grep "^  Who:" | sed 's/.*Who: *//')
+
+              if [ -n "$LOCK_ID" ]; then
+                echo "   Lock ID: $LOCK_ID"
+                echo "   Created: $LOCK_CREATED"
+                echo "   Owner: $LOCK_OWNER"
+
+                LOCK_TIMESTAMP=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
+                CURRENT_TIMESTAMP=$(date +%s)
+                AGE_SECONDS=$((CURRENT_TIMESTAMP - LOCK_TIMESTAMP))
+                AGE_MINUTES=$((AGE_SECONDS / 60))
+
+                echo "   Lock age: ${AGE_MINUTES} minutes"
+
+                IS_CI_LOCK=false
+                if echo "$LOCK_OWNER" | grep -qi "github-actions\|ec2-github-runner"; then
+                  IS_CI_LOCK=true
+                fi
+
+                if [ "$IS_CI_LOCK" = "true" ] && { [ $AGE_MINUTES -gt 15 ] || [ $LOCK_TIMESTAMP -eq 0 ]; }; then
+                  echo "Force-unlocking stale CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan.binary -input=false -no-color 2>&1 | tee plan-output.txt
+                  RETRY_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ $RETRY_EXIT_CODE -ne 0 ]; then
+                    echo "Plan retry failed with exit code $RETRY_EXIT_CODE"
+                    exit $RETRY_EXIT_CODE
+                  fi
+                elif [ "$IS_CI_LOCK" = "false" ] && [ $AGE_MINUTES -gt 30 ]; then
+                  echo "Force-unlocking very stale non-CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan.binary -input=false -no-color 2>&1 | tee plan-output.txt
+                  RETRY_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ $RETRY_EXIT_CODE -ne 0 ]; then
+                    echo "Plan retry failed with exit code $RETRY_EXIT_CODE"
+                    exit $RETRY_EXIT_CODE
+                  fi
+                else
+                  echo "Lock is active (${AGE_MINUTES}m old, owner: $LOCK_OWNER); exiting to avoid concurrent Terraform operations. Retry after the lock holder finishes."
+                  exit 1
+                fi
+              else
+                echo "Could not extract lock ID, manual intervention required"
+                exit 1
+              fi
+            else
+              exit 1
+            fi
+          fi
+
+          # Convert to JSON for checksum
+          terraform show -json tfplan.binary > plan.json
+
+          # Generate human-readable summary
+          SUMMARY=$(grep -E "Plan:|No changes" plan-output.txt | tail -1 || echo "Plan generated")
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Generate Plan Checksum
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan') || contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-detection')
+        id: checksum
+        working-directory: ${{ inputs.workspace_path }}
+        run: |
+          echo "Generating structural fingerprint checksum..."
+
+          # Extract only resource change addresses and actions (the only thing that matters for merge safety)
+          # Sorted deterministically with jq -S to ensure identical plans always produce identical checksums
+          jq -S '[.resource_changes // [] | .[] | select(.change.actions != ["no-op"]) | {address: .address, actions: .change.actions}]' plan.json > plan-fingerprint.json
+
+          # Generate SHA256 checksum
+          CHECKSUM=$(sha256sum plan-fingerprint.json | cut -d' ' -f1)
+          echo "$CHECKSUM" > plan.checksum
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "Plan checksum: $CHECKSUM"
+
+      - name: Create Metadata
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        working-directory: ${{ inputs.workspace_path }}
+        run: |
+          cat > metadata.json <<EOF
+          {
+            "workspace_name": "${{ inputs.workspace_name }}",
+            "workspace_path": "${{ inputs.workspace_path }}",
+            "environment": "${{ inputs.environment }}",
+            "git_ref": "${{ inputs.git_ref }}",
+            "git_sha": "${{ github.sha }}",
+            "pr_number": "${{ inputs.pr_number }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "terraform_version": "${{ inputs.terraform_version }}",
+            "checksum": "${{ steps.checksum.outputs.checksum }}"
+          }
+          EOF
+
+      - name: Upload Plan Artifact
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ inputs.workspace_name }}-pr-${{ inputs.pr_number }}
+          path: |
+            ${{ inputs.workspace_path }}/plan.json
+            ${{ inputs.workspace_path }}/plan-output.txt
+            ${{ inputs.workspace_path }}/plan.checksum
+            ${{ inputs.workspace_path }}/tfplan.binary
+            ${{ inputs.workspace_path }}/metadata.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Set plan outputs
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan') || contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-detection')
+        id: plan-outputs
+        run: |
+          echo "checksum=${{ steps.checksum.outputs.checksum }}" >> $GITHUB_OUTPUT
+          echo "summary=${{ steps.plan.outputs.summary }}" >> $GITHUB_OUTPUT
+
+      - name: Set artifact outputs
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        id: artifact-outputs
+        run: |
+          echo "name=terraform-plan-${{ inputs.workspace_name }}-pr-${{ inputs.pr_number }}" >> $GITHUB_OUTPUT
+
+      # ========== OPA POLICY CHECK ==========
+      - name: Run OPA Policy Checks
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan') && inputs.run_opa_policy
+        id: opa
+        working-directory: ${{ inputs.workspace_path }}
+        continue-on-error: true
+        run: |
+          echo "Running OPA policy checks..."
+
+          # Pre-flight syntax check (catches rego compile errors with clear messages)
+          if ! opa check $GITHUB_WORKSPACE/.github/policies/terraform.rego 2>&1; then
+            echo "::warning::OPA policy has syntax errors (see output above)"
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "violations=unknown" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Run OPA tests if test files exist
+          if ls $GITHUB_WORKSPACE/.github/policies/*_test.rego 1>/dev/null 2>&1; then
+            echo "Running OPA policy tests..."
+            if ! opa test $GITHUB_WORKSPACE/.github/policies/ -v 2>&1; then
+              echo "::warning::OPA policy tests failed (see output above)"
+              echo "status=error" >> $GITHUB_OUTPUT
+              echo "violations=unknown" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          OPA_EXIT=0
+          opa eval \
+            --data $GITHUB_WORKSPACE/.github/policies/terraform.rego \
+            --input plan.json \
+            --format json \
+            "data.terraform.deny" > opa-results.json 2> opa-eval-stderr.txt || OPA_EXIT=$?
+
+          if [ $OPA_EXIT -ne 0 ] || [ ! -s opa-results.json ]; then
+            echo "::warning::OPA evaluation failed (exit code: $OPA_EXIT)"
+            cat opa-eval-stderr.txt
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "violations=unknown" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          VIOLATIONS=$(jq '[.result[0].expressions[0].value // [] | .[] | select(. != null)] | length' opa-results.json)
+          PARSE_EXIT=$?
+
+          if [ $PARSE_EXIT -ne 0 ] || [ -z "$VIOLATIONS" ]; then
+            echo "::warning::Failed to parse OPA results JSON"
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "violations=unknown" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo "status=fail" >> $GITHUB_OUTPUT
+            echo "violations=$VIOLATIONS" >> $GITHUB_OUTPUT
+            echo "OPA policy violations found: $VIOLATIONS"
+            jq -r '.result[0].expressions[0].value[]' opa-results.json || true
+          else
+            echo "status=pass" >> $GITHUB_OUTPUT
+            echo "violations=0" >> $GITHUB_OUTPUT
+            echo "No OPA policy violations"
+          fi
+
+      - name: Set OPA outputs
+        id: opa-outputs
+        run: |
+          status="${{ steps.opa.outputs.status }}"
+          echo "status=${status:-skipped}" >> $GITHUB_OUTPUT
+
+      # ========== RESULTS ARTIFACTS ==========
+      - name: Create Results Summary
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        working-directory: ${{ inputs.workspace_path }}
+        run: |
+          cat > results-summary.json <<EOF
+          {
+            "workspace_name": "${{ inputs.workspace_name }}",
+            "workspace_path": "${{ inputs.workspace_path }}",
+            "environment": "${{ inputs.environment }}",
+            "plan_checksum": "${{ steps.checksum.outputs.checksum }}",
+            "plan_summary": "${{ steps.plan.outputs.summary }}",
+            "security_status": "${{ steps.tfsec.outputs.status || 'skipped' }}",
+            "security_summary": "${{ steps.tfsec.outputs.summary || 'skipped' }}",
+            "opa_status": "${{ steps.opa.outputs.status || 'skipped' }}",
+            "opa_violations": "${{ steps.opa.outputs.violations || '0' }}",
+            "pr_number": "${{ inputs.pr_number }}",
+            "git_sha": "${{ github.sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          echo "Results summary created"
+
+      - name: Upload Results Artifact
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'plan')
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ inputs.workspace_name }}-pr-${{ inputs.pr_number }}
+          path: |
+            ${{ inputs.workspace_path }}/results-summary.json
+            ${{ inputs.workspace_path }}/tfsec-results.json
+            ${{ inputs.workspace_path }}/opa-results.json
+            ${{ inputs.workspace_path }}/opa-eval-stderr.txt
+            ${{ inputs.workspace_path }}/plan.json
+            ${{ inputs.workspace_path }}/plan-output.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ========== DRIFT DETECTION OPERATION ==========
+      - name: Perform Drift Detection
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-detection')
+        id: drift-detection
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+        run: |
+          echo "Performing drift detection..."
+
+          # Save PR checksum (from plan step that ran earlier in this job)
+          PR_CHECKSUM="${{ steps.checksum.outputs.checksum }}"
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Temporarily remove global SSH redirect to allow checkout credentials to work
+          export HOME="${HOME:-/root}"
+          git config --global --unset url."git@github.com:".insteadOf || true
+
+          # Fetch and merge target branch
+          git fetch origin ${{ inputs.merge_target }}
+          git merge --no-commit --no-ff origin/${{ inputs.merge_target }} || {
+            echo "MERGE CONFLICT: Cannot automatically merge. Please rebase on ${{ inputs.merge_target }}"
+            exit 1
+          }
+
+          # Restore global SSH redirect for Terraform module fetches
+          export HOME="${HOME:-/root}"
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+          # Ensure plugin cache directory exists
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+          # Re-initialize with retry logic
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          INIT_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Terraform init attempt $RETRY_COUNT of $MAX_RETRIES..."
+
+            if timeout 300 terraform init -backend=true -input=false -backend-config="profile="; then
+              INIT_SUCCESS=true
+              echo "Terraform init succeeded on attempt $RETRY_COUNT"
+              break
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "Terraform init timed out after 5 minutes"
+              else
+                echo "Terraform init failed with exit code $EXIT_CODE"
+              fi
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                WAIT_TIME=$((30 * RETRY_COUNT))
+                echo "Retrying in ${WAIT_TIME} seconds..."
+                sleep $WAIT_TIME
+              fi
+            fi
+          done
+
+          if [ "$INIT_SUCCESS" != "true" ]; then
+            echo "Terraform init failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          # Plan with stale lock handling
+          set +e
+          terraform plan -out=tfplan-merged.binary -input=false -no-color 2>&1 | tee plan-merged-output.txt
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            if grep -q "Error acquiring the state lock" plan-merged-output.txt; then
+              echo "State lock detected, checking if stale..."
+              LOCK_ID=$(grep -A 10 "Lock Info:" plan-merged-output.txt | grep "^  ID:" | awk '{print $2}')
+              LOCK_CREATED=$(grep "Created:" plan-merged-output.txt | sed 's/.*Created: *//')
+              LOCK_OWNER=$(grep -A 10 "Lock Info:" plan-merged-output.txt | grep "^  Who:" | sed 's/.*Who: *//')
+
+              if [ -n "$LOCK_ID" ]; then
+                LOCK_TIMESTAMP=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
+                CURRENT_TIMESTAMP=$(date +%s)
+                AGE_SECONDS=$((CURRENT_TIMESTAMP - LOCK_TIMESTAMP))
+                AGE_MINUTES=$((AGE_SECONDS / 60))
+
+                IS_CI_LOCK=false
+                if echo "$LOCK_OWNER" | grep -qi "github-actions\|ec2-github-runner"; then
+                  IS_CI_LOCK=true
+                fi
+
+                if [ "$IS_CI_LOCK" = "true" ] && { [ $AGE_MINUTES -gt 15 ] || [ $LOCK_TIMESTAMP -eq 0 ]; }; then
+                  echo "Force-unlocking stale CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan-merged.binary -input=false -no-color
+                elif [ "$IS_CI_LOCK" = "false" ] && [ $AGE_MINUTES -gt 30 ]; then
+                  echo "Force-unlocking very stale non-CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan-merged.binary -input=false -no-color
+                else
+                  echo "Lock is active (${AGE_MINUTES}m old, owner: $LOCK_OWNER)"
+                  exit 1
+                fi
+              else
+                echo "Could not extract lock ID"
+                exit 1
+              fi
+            else
+              exit 1
+            fi
+          fi
+
+          terraform show -json tfplan-merged.binary > plan-merged.json
+
+          # Generate merged structural fingerprint (same extraction as PR plan)
+          jq -S '[.resource_changes // [] | .[] | select(.change.actions != ["no-op"]) | {address: .address, actions: .change.actions}]' plan-merged.json > plan-merged-fingerprint.json
+
+          MERGED_CHECKSUM=$(sha256sum plan-merged-fingerprint.json | cut -d' ' -f1)
+
+          # Compare checksums
+          if [ "$PR_CHECKSUM" != "$MERGED_CHECKSUM" ]; then
+            echo "CHECKSUM MISMATCH"
+            echo "   PR Plan Checksum:     $PR_CHECKSUM"
+            echo "   Merged Plan Checksum: $MERGED_CHECKSUM"
+            echo ""
+            echo "This means merging will change the Terraform plan."
+            echo "Action: Rebase your PR on ${{ inputs.merge_target }} and re-run validation."
+            echo "checksum_match=false" >> $GITHUB_OUTPUT
+          else
+            echo "CHECKSUM MATCH - Merging will produce the same plan"
+            echo "   PR Plan Checksum:     $PR_CHECKSUM"
+            echo "   Merged Plan Checksum: $MERGED_CHECKSUM"
+            echo "checksum_match=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set drift detection outputs
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-detection')
+        id: drift-detection-outputs
+        run: |
+          checksum_match="${{ steps.drift-detection.outputs.checksum_match }}"
+          echo "checksum_match=${checksum_match:-false}" >> $GITHUB_OUTPUT
+
+      # ========== DRIFT CHECK OPERATION (standalone, for post-merge) ==========
+      - name: Drift Check
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-check')
+        id: drift-check
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+        run: |
+          echo "Checking for infrastructure drift..."
+
+          ARTIFACT_NAME="terraform-plan-${{ inputs.workspace_name }}-pr-${{ inputs.pr_number }}"
+
+          # Find the latest successful PR validation run that has this artifact
+          LATEST_RUN_ID=""
+          for RUN_ID in $(gh run list --workflow=terraform-pr.yml --status=completed --conclusion=success --limit=10 --json databaseId --jq '.[].databaseId' 2>/dev/null); do
+            if gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" --jq '.artifacts[].name' 2>/dev/null | grep -qx "$ARTIFACT_NAME"; then
+              LATEST_RUN_ID="$RUN_ID"
+              break
+            fi
+          done
+
+          if [ -z "$LATEST_RUN_ID" ]; then
+            echo "Cannot find a successful PR validation run"
+            echo "Please re-run PR validation to generate a new plan."
+            echo "detected=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Downloading artifact from run $LATEST_RUN_ID"
+
+          # Download approved PR plan artifact from the specific run
+          gh run download "$LATEST_RUN_ID" --name "$ARTIFACT_NAME" || {
+            echo "Cannot find approved plan artifact: $ARTIFACT_NAME in run $LATEST_RUN_ID"
+            echo "Please re-run PR validation to generate a new plan."
+            echo "detected=true" >> $GITHUB_OUTPUT
+            exit 1
+          }
+
+          PR_CHECKSUM=$(cat plan.checksum)
+
+          # Ensure plugin cache directory exists
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+          # Generate fresh plan with retry
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          INIT_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Terraform init attempt $RETRY_COUNT of $MAX_RETRIES..."
+
+            if timeout 300 terraform init -backend=true -input=false -backend-config="profile="; then
+              INIT_SUCCESS=true
+              echo "Terraform init succeeded on attempt $RETRY_COUNT"
+              break
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "Terraform init timed out after 5 minutes"
+              else
+                echo "Terraform init failed with exit code $EXIT_CODE"
+              fi
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                WAIT_TIME=$((30 * RETRY_COUNT))
+                echo "Retrying in ${WAIT_TIME} seconds..."
+                sleep $WAIT_TIME
+              fi
+            fi
+          done
+
+          if [ "$INIT_SUCCESS" != "true" ]; then
+            echo "Terraform init failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          # Plan with stale lock handling
+          set +e
+          terraform plan -out=tfplan-main.binary -input=false -no-color 2>&1 | tee plan-main-output.txt
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            if grep -q "Error acquiring the state lock" plan-main-output.txt; then
+              echo "State lock detected, checking if stale..."
+              LOCK_ID=$(grep -A 10 "Lock Info:" plan-main-output.txt | grep "^  ID:" | awk '{print $2}')
+              LOCK_CREATED=$(grep "Created:" plan-main-output.txt | sed 's/.*Created: *//')
+              LOCK_OWNER=$(grep -A 10 "Lock Info:" plan-main-output.txt | grep "^  Who:" | sed 's/.*Who: *//')
+
+              if [ -n "$LOCK_ID" ]; then
+                LOCK_TIMESTAMP=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
+                CURRENT_TIMESTAMP=$(date +%s)
+                AGE_SECONDS=$((CURRENT_TIMESTAMP - LOCK_TIMESTAMP))
+                AGE_MINUTES=$((AGE_SECONDS / 60))
+
+                IS_CI_LOCK=false
+                if echo "$LOCK_OWNER" | grep -qi "github-actions\|ec2-github-runner"; then
+                  IS_CI_LOCK=true
+                fi
+
+                if [ "$IS_CI_LOCK" = "true" ] && { [ $AGE_MINUTES -gt 15 ] || [ $LOCK_TIMESTAMP -eq 0 ]; }; then
+                  echo "Force-unlocking stale CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan-main.binary -input=false -no-color
+                elif [ "$IS_CI_LOCK" = "false" ] && [ $AGE_MINUTES -gt 30 ]; then
+                  echo "Force-unlocking very stale non-CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying plan..."
+                  terraform plan -out=tfplan-main.binary -input=false -no-color
+                else
+                  echo "Lock is active (${AGE_MINUTES}m old, owner: $LOCK_OWNER)"
+                  exit 1
+                fi
+              else
+                echo "Could not extract lock ID"
+                exit 1
+              fi
+            else
+              exit 1
+            fi
+          fi
+
+          terraform show -json tfplan-main.binary > plan-main.json
+
+          # Generate main structural fingerprint (same extraction as PR plan)
+          jq -S '[.resource_changes // [] | .[] | select(.change.actions != ["no-op"]) | {address: .address, actions: .change.actions}]' plan-main.json > plan-main-fingerprint.json
+
+          MAIN_CHECKSUM=$(sha256sum plan-main-fingerprint.json | cut -d' ' -f1)
+
+          # Compare
+          if [ "$PR_CHECKSUM" != "$MAIN_CHECKSUM" ]; then
+            echo "detected=true" >> $GITHUB_OUTPUT
+            echo "DRIFT DETECTED"
+            echo "   Approved PR Plan: $PR_CHECKSUM"
+            echo "   Current Main:     $MAIN_CHECKSUM"
+            echo ""
+            echo "Infrastructure has changed since PR #${{ inputs.pr_number }} was approved."
+            exit 1
+          else
+            echo "detected=false" >> $GITHUB_OUTPUT
+            echo "NO DRIFT DETECTED"
+          fi
+
+      - name: Set drift outputs
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'drift-check')
+        id: drift-outputs
+        run: |
+          detected="${{ steps.drift-check.outputs.detected }}"
+          echo "detected=${detected:-false}" >> $GITHUB_OUTPUT
+
+      # ========== APPLY OPERATION ==========
+      - name: Terraform Apply
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'apply')
+        working-directory: ${{ inputs.workspace_path }}
+        env:
+          TF_VAR_newrelic_api_key: ${{ secrets.NEW_RELIC_API_KEY }}
+        run: |
+          echo "Applying Terraform changes..."
+
+          # Apply with stale lock handling
+          set +e
+          terraform apply -auto-approve -input=false -no-color 2>&1 | tee apply-output.txt
+          APPLY_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $APPLY_EXIT_CODE -ne 0 ]; then
+            if grep -q "Error acquiring the state lock" apply-output.txt; then
+              echo "State lock detected, checking if stale..."
+              LOCK_ID=$(grep -A 10 "Lock Info:" apply-output.txt | grep "^  ID:" | awk '{print $2}')
+              LOCK_CREATED=$(grep "Created:" apply-output.txt | sed 's/.*Created: *//')
+              LOCK_OWNER=$(grep -A 10 "Lock Info:" apply-output.txt | grep "^  Who:" | sed 's/.*Who: *//')
+
+              if [ -n "$LOCK_ID" ]; then
+                LOCK_TIMESTAMP=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
+                CURRENT_TIMESTAMP=$(date +%s)
+                AGE_SECONDS=$((CURRENT_TIMESTAMP - LOCK_TIMESTAMP))
+                AGE_MINUTES=$((AGE_SECONDS / 60))
+
+                IS_CI_LOCK=false
+                if echo "$LOCK_OWNER" | grep -qi "github-actions\|ec2-github-runner"; then
+                  IS_CI_LOCK=true
+                fi
+
+                if [ "$IS_CI_LOCK" = "true" ] && { [ $AGE_MINUTES -gt 15 ] || [ $LOCK_TIMESTAMP -eq 0 ]; }; then
+                  echo "Force-unlocking stale CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying apply..."
+                  terraform apply -auto-approve -input=false -no-color 2>&1 | tee apply-output.txt
+                  RETRY_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ $RETRY_EXIT_CODE -ne 0 ]; then
+                    echo "Apply retry failed with exit code $RETRY_EXIT_CODE"
+                    exit $RETRY_EXIT_CODE
+                  fi
+                elif [ "$IS_CI_LOCK" = "false" ] && [ $AGE_MINUTES -gt 30 ]; then
+                  echo "Force-unlocking very stale non-CI lock (age: ${AGE_MINUTES}m, owner: $LOCK_OWNER)"
+                  terraform force-unlock -force "$LOCK_ID"
+                  echo "Retrying apply..."
+                  terraform apply -auto-approve -input=false -no-color 2>&1 | tee apply-output.txt
+                  RETRY_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ $RETRY_EXIT_CODE -ne 0 ]; then
+                    echo "Apply retry failed with exit code $RETRY_EXIT_CODE"
+                    exit $RETRY_EXIT_CODE
+                  fi
+                else
+                  echo "Lock is active (${AGE_MINUTES}m old, owner: $LOCK_OWNER); exiting to avoid concurrent Terraform operations. Retry after the lock holder finishes."
+                  exit 1
+                fi
+              else
+                echo "Could not extract lock ID"
+                exit 1
+              fi
+            else
+              exit 1
+            fi
+          fi
+
+          echo "Terraform apply completed successfully"
+
+      - name: Upload Apply Output
+        if: contains(fromJson(steps.resolve-ops.outputs.ops), 'apply')
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-apply-${{ inputs.workspace_name }}-${{ github.run_id }}
+          path: ${{ inputs.workspace_path }}/apply-output.txt
+          retention-days: 90
+
+  # Job 4: Stop EC2 runner (ALWAYS runs, even on failure)
+  stop-runner:
+    name: Stop EC2 Runner
+    runs-on: ubuntu-latest
+    needs: [start-runner, terraform-operation]
+    if: always() && needs.start-runner.outputs.ec2-instance-id != ''
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Configure AWS credentials
+        uses: swoogo/.github/.github/actions/aws-auth@main
+        with:
+          region: ${{ inputs.aws_region }}
+          role: ${{ inputs.aws_role_arn }}
+
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: stop
+          github-token: ${{ secrets.CI_REGISTER_RUNNER_TOKEN }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
+
+      - name: Runner stopped successfully
+        run: |
+          echo "EC2 runner stopped and terminated"
+          echo "   Instance ID: ${{ needs.start-runner.outputs.ec2-instance-id }}"
