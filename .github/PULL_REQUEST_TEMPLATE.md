@@ -1,6 +1,6 @@
 ![](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExNnY4Nm41cHFkNDdqajc5YjFuMDVxNWUxZ2FwNWc5dnB4Y3Iwa3dicCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/cFkiFMDg3iFoI/giphy.gif)
 
-*replace with your own gif, brighten up your merge request with something fun*
+*replace with your own gif, brighten up your pull request with something fun*
 
 ### ☀️ What and Why
 
